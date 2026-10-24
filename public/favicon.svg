@@ -1,0 +1,13 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="The Evening Club">
+  <defs>
+    <linearGradient id="a" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#f7cc77"/>
+      <stop offset="100%" stop-color="#d76d86"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="18" fill="#101827"/>
+  <circle cx="32" cy="28" r="16" fill="url(#a)" opacity="0.95"/>
+  <circle cx="39" cy="20" r="2.3" fill="#fff3d8"/>
+  <path d="M23 41c5-5 13-5 18 0" fill="none" stroke="#f0e9d7" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M18 42c7-4 11-5 14-6 6 1 9 4 14 6" fill="none" stroke="#f0e9d7" stroke-width="2.2" stroke-linecap="round" opacity="0.8"/>
+</svg>
