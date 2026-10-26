@@ -48,32 +48,6 @@ Without Supabase configuration, app data is stored in the current browser's loca
 
 When you sign in, existing local data is preserved on the device. If the account already has cloud records, the app displays those records while keeping the local backup separate. If the account has no cloud records, your local data remains visible and you can either import it to the account or choose to start using cloud storage. Data is not silently deleted or automatically merged. Signing out restores the saved local data on that device.
 
-## Enable Google sign-in and Supabase sync
-
-Authentication is optional. To enable it for local development and the hosted site:
-
-1. Create a Supabase project and run [`supabase/schema.sql`](./supabase/schema.sql) in the project's SQL Editor. The schema enables row-level security for user-owned data.
-2. In Google Cloud Console, create an OAuth 2.0 web client. Add the site origin `https://thedeepsleepers.netlify.app` and, for local development, `http://localhost:5173` to **Authorized JavaScript origins**. Add the Supabase Google callback URL (shown in Supabase; typically `https://<project-ref>.supabase.co/auth/v1/callback`) to **Authorized redirect URIs**.
-3. In Supabase, enable Google under **Authentication → Providers** and enter the Google client ID and client secret. Under **Authentication → URL Configuration**, set the site URL and allow the hosted URL and `http://localhost:5173` as redirect URLs.
-4. Set the following environment variables for local development in a `.env` file, or configure them in Netlify's environment settings before deployment:
-
-   ```text
-   VITE_SUPABASE_URL=https://<project-ref>.supabase.co
-   VITE_SUPABASE_ANON_KEY=<project-anon-or-publishable-key>
-   ```
-
-   `.env.example` contains placeholders. Restart the local Vite server after changing environment variables. Changes to Netlify environment variables require a new deploy.
-
-Only the Supabase project URL and browser-safe anon/publishable key belong in the client environment. **Never expose a Supabase service-role key or Google OAuth client secret in frontend code or `VITE_` variables.**
-
-Until Supabase variables are included in the deployed build, Settings still shows the Google sign-in option, but sign-in will report that the build is not configured. Configure the variables and deploy again to activate OAuth.
-
-## Deployment
-
-The repository includes `netlify.toml` with the Vite build command, `dist` publish directory, and SPA fallback routing. Connect the repository to Netlify, add the Supabase environment variables if using cloud features, and deploy.
-
-GitHub Actions in [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) runs dependency installation, linting, and the production build on pushes and pull requests.
-
 ## Project layout
 
 ```text
