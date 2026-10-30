@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { motion } from 'framer-motion'
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
+import { Reorder, motion, useDragControls } from 'framer-motion'
 import {
   BarChart3,
   Check,
@@ -9,6 +9,7 @@ import {
   Coffee,
   Cloud,
   ExternalLink,
+  GripVertical,
   History,
   Home,
   ListTodo,
@@ -33,6 +34,8 @@ import {
   YAxis,
 } from 'recharts'
 import type { User } from '@supabase/supabase-js'
+import { HeatmapGrid, type HeatmapCell } from './components/HeatmapGrid'
+import { PeriodStrip } from './components/PeriodStrip'
 import { supabase, supabaseConfigured } from './lib/supabase'
 import './App.css'
 
@@ -84,7 +87,7 @@ const navItems: { id: NavTab; label: string; icon: typeof Home }[] = [
   { id: 'settings', label: 'Settings', icon: Settings },
 ]
 
-const weekdayLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+const weekdayLabels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 
 function safeParse<T>(key: string, fallback: T): T {
   if (typeof window === 'undefined') return fallback
@@ -227,7 +230,7 @@ function getRangeDates(range: RangeKind, anchor: Date): { start: Date; end: Date
     }
     case 'week': {
       const start = new Date(dateOnly)
-      const dayOfWeek = (start.getDay() + 6) % 7
+      const dayOfWeek = start.getDay()
       start.setDate(start.getDate() - dayOfWeek)
       const end = addDays(start, 6)
       return { start, end, dates: listDatesBetween(start, end) }
@@ -264,13 +267,185 @@ function shiftRange(range: RangeKind, anchor: Date, direction: number): Date {
 
 function getMonthGridOffset(date: Date): number {
   const firstDay = new Date(date.getFullYear(), date.getMonth(), 1)
-  const offset = (firstDay.getDay() + 6) % 7
+  const offset = firstDay.getDay()
   return offset
+}
+
+// Bedtimes before noon belong to the previous evening (see normalizeBedtime), so the logging
+// day stays on the evening still in progress after midnight instead of rolling to the next date.
+const OPERATIONAL_DAY_CUTOFF_HOUR = 12
+
+function getOperationalDateKey(date: Date): string {
+  const operational = new Date(date.getFullYear(), date.getMonth(), date.getDate())
+  if (date.getHours() < OPERATIONAL_DAY_CUTOFF_HOUR) operational.setDate(operational.getDate() - 1)
+  return getLocalDateKey(operational)
+}
+
+type PeriodOffset = -1 | 0 | 1
+type CompletionTone = 'done' | 'missed' | 'empty'
+
+const CURRENT_WINDOW_LABELS: Record<RangeKind, string> = {
+  day: 'Today',
+  week: 'Week-to-Date',
+  month: 'Month-to-Date',
+  year: 'Year-to-Date',
+}
+
+const PAST_WINDOW_LABELS: Record<RangeKind, string> = {
+  day: 'Single day',
+  week: 'Full week',
+  month: 'Full month',
+  year: 'Full year',
+}
+
+const TONE_TEXT: Record<CompletionTone, { label: string; tooltip: string }> = {
+  done: { label: 'wind-down completed', tooltip: 'completed' },
+  missed: { label: 'wind-down not completed', tooltip: 'not completed' },
+  empty: { label: 'no entry', tooltip: 'no entry' },
+}
+
+type InsightsPeriod = {
+  range: RangeKind
+  windowLabel: string
+  rangeLabel: string
+  loggedEntries: EveningEntry[]
+  avgBedtime: string
+  completionRate: number
+  chartData: { date: string; label: string; bedtime: number | null }[]
+  bedtimeDomain: [number, number]
+  bedtimeTicks: number[]
+  heatmapCells: HeatmapCell[]
+}
+
+function buildInsightsPeriod(
+  range: RangeKind,
+  anchor: Date,
+  entryMap: Record<string, EveningEntry>,
+  todayKey: string,
+): InsightsPeriod {
+  const info = getRangeDates(range, anchor)
+  const today = toDateFromKey(todayKey)
+  const isCurrent = info.start <= today && today <= info.end
+  const loggedEntries = info.dates
+    .map((dateKey) => entryMap[dateKey])
+    .filter((entry): entry is EveningEntry => Boolean(entry))
+
+  const chartData = info.dates.map((dateKey) => {
+    const entry = entryMap[dateKey]
+    return {
+      date: dateKey,
+      label: formatDateLabel(dateKey),
+      bedtime: entry ? normalizeBedtime(entry.bedtime) : null,
+    }
+  })
+  const bedtimes = chartData
+    .map((item) => item.bedtime)
+    .filter((value): value is number => value !== null)
+  const chartMinimum = bedtimes.length ? Math.min(...bedtimes) : 20 * 60
+  const chartMaximum = bedtimes.length ? Math.max(...bedtimes) : 28 * 60
+  const chartPadding = Math.max(30, Math.min(90, (chartMaximum - chartMinimum) / 4))
+  const bedtimeDomain: [number, number] = [chartMinimum - chartPadding, chartMaximum + chartPadding]
+  const bedtimeTicks = Array.from({ length: 5 }, (_, index) =>
+    bedtimeDomain[0] + ((bedtimeDomain[1] - bedtimeDomain[0]) * index) / 4,
+  )
+
+  // The month grid starts on Sunday, so leading blanks align the first day under its weekday.
+  // The year view is a plain flow of day tiles with no weekday alignment.
+  const spacer = (key: string): HeatmapCell => ({ key, date: null, tone: 'spacer', label: '', tooltip: '' })
+  const leadingOffset = range === 'month' ? info.start.getDay() : 0
+  const heatmapCells: HeatmapCell[] = [
+    ...Array.from({ length: leadingOffset }, (_, index) => spacer(`offset-${index}`)),
+    ...info.dates.map((dateKey): HeatmapCell => {
+      const entry = entryMap[dateKey]
+      const tone: CompletionTone = !entry ? 'empty' : entry.routineCompleted ? 'done' : 'missed'
+      return {
+        key: dateKey,
+        date: dateKey,
+        tone,
+        label: `${dateKey}: ${TONE_TEXT[tone].label}`,
+        tooltip: `${formatDisplayDate(toDateFromKey(dateKey))}: ${TONE_TEXT[tone].tooltip}`,
+      }
+    }),
+  ]
+  if (range === 'month') {
+    const trailing = Array.from({ length: 6 * 7 - heatmapCells.length }, (_, index) => spacer(`trailing-${index}`))
+    heatmapCells.push(...trailing)
+  }
+
+  return {
+    range,
+    windowLabel: isCurrent ? CURRENT_WINDOW_LABELS[range] : PAST_WINDOW_LABELS[range],
+    rangeLabel: `${formatDisplayDate(info.start)}–${formatDisplayDate(info.end)}`,
+    loggedEntries,
+    avgBedtime: computeAverageBedtime(loggedEntries),
+    completionRate: computeCompletionRate(loggedEntries),
+    chartData,
+    bedtimeDomain,
+    bedtimeTicks,
+    heatmapCells,
+  }
+}
+
+type RoutineStepRowProps = {
+  step: RoutineStep
+  isComplete: boolean
+  onToggle: () => void
+  onDelete: () => void
+  onMove: (direction: -1 | 1) => void
+  onDragStart: () => void
+  onDragEnd: () => void
+}
+
+function RoutineStepRow({ step, isComplete, onToggle, onDelete, onMove, onDragStart, onDragEnd }: RoutineStepRowProps) {
+  const dragControls = useDragControls()
+
+  const handleHandleKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      onMove(-1)
+    } else if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      onMove(1)
+    }
+  }
+
+  return (
+    <Reorder.Item
+      as="div"
+      value={step}
+      dragListener={false}
+      dragControls={dragControls}
+      onDragStart={onDragStart}
+      onDragEnd={onDragEnd}
+      whileDrag={{ scale: 1.01 }}
+      className={`checklist-item ${isComplete ? 'complete' : ''}`}
+    >
+      <button type="button" className="check-toggle" onClick={onToggle} aria-label={`${isComplete ? 'Mark incomplete' : 'Mark complete'} ${step.label}`}>
+        {isComplete ? <Check size={14} /> : <CircleDashed size={14} />}
+      </button>
+      <span>{step.label}</span>
+      <div className="checklist-actions">
+        <button
+          type="button"
+          className="drag-handle"
+          onPointerDown={(event) => dragControls.start(event)}
+          onKeyDown={handleHandleKeyDown}
+          aria-label={`Reorder ${step.label} by dragging, or with the up and down arrow keys`}
+          title="Drag to reorder"
+        >
+          <GripVertical size={16} />
+        </button>
+        <button type="button" className="icon-button danger" onClick={onDelete} aria-label={`Delete ${step.label}`}>
+          <Trash2 size={14} />
+        </button>
+      </div>
+    </Reorder.Item>
+  )
 }
 
 function App() {
   const [activeTab, setActiveTab] = useState<NavTab>('daily')
-  const [todayDateKey, setTodayDateKey] = useState(() => getLocalDateKey(new Date()))
+  const [todayDateKey, setTodayDateKey] = useState(() => getOperationalDateKey(new Date()))
   const [selectedDate, setSelectedDate] = useState(() => todayDateKey)
   const [selectedCalendarDate, setSelectedCalendarDate] = useState<string | null>(null)
   const [theme, setTheme] = useState<ThemeMode>(() => {
@@ -323,7 +498,7 @@ function App() {
 
   useEffect(() => {
     const interval = window.setInterval(() => {
-      const nextDateKey = getLocalDateKey(new Date())
+      const nextDateKey = getOperationalDateKey(new Date())
       setTodayDateKey((current) => current === nextDateKey ? current : nextDateKey)
     }, 60_000)
     return () => window.clearInterval(interval)
@@ -475,66 +650,75 @@ function App() {
     document.documentElement.dataset.theme = shouldUseDark ? 'dark' : 'light'
   }, [theme])
 
-  const rangeInfo = useMemo(() => getRangeDates(insightsRange, insightsAnchor), [insightsRange, insightsAnchor])
-  const rangeEntries = useMemo(() => {
-    return entries.filter((entry) => {
-      const dateValue = toDateFromKey(entry.date)
-      return dateValue >= rangeInfo.start && dateValue <= rangeInfo.end
-    })
-  }, [entries, rangeInfo])
-
-  const avgBedtime = computeAverageBedtime(rangeEntries)
-  const completionRate = computeCompletionRate(rangeEntries)
-
-  const chartData = rangeInfo.dates.map((dateKey) => {
-    const entry = entryMap[dateKey]
-    return {
-      date: dateKey,
-      label: formatDateLabel(dateKey),
-      bedtime: entry ? normalizeBedtime(entry.bedtime) : null,
-    }
-  })
-
-  const bedtimes = chartData
-    .map((item) => item.bedtime)
-    .filter((value): value is number => value !== null)
-  const chartMinimum = bedtimes.length ? Math.min(...bedtimes) : 20 * 60
-  const chartMaximum = bedtimes.length ? Math.max(...bedtimes) : 28 * 60
-  const chartPadding = Math.max(30, Math.min(90, (chartMaximum - chartMinimum) / 4))
-  const bedtimeDomain: [number, number] = [
-    chartMinimum - chartPadding,
-    chartMaximum + chartPadding,
-  ]
-  const bedtimeTicks = Array.from({ length: 5 }, (_, index) =>
-    bedtimeDomain[0] + ((bedtimeDomain[1] - bedtimeDomain[0]) * index) / 4,
+  const currentPeriod = useMemo(
+    () => buildInsightsPeriod(insightsRange, insightsAnchor, entryMap, todayDateKey),
+    [insightsRange, insightsAnchor, entryMap, todayDateKey],
   )
 
-  const completionTileData = rangeInfo.dates.map((dateKey) => {
-    const entry = entryMap[dateKey]
-    return {
-      date: dateKey,
-      tone: !entry ? 'empty' : entry.routineCompleted ? 'done' : 'missed',
-    }
-  })
-  const heatmapOffset =
-    insightsRange === 'month' || insightsRange === 'year'
-      ? (rangeInfo.start.getDay() + 6) % 7
-      : 0
-  const heatmapCells = [
-    ...Array.from({ length: heatmapOffset }, (_, index) => ({ key: `offset-${index}`, date: null, tone: 'spacer' })),
-    ...completionTileData.map((item) => ({ key: item.date, date: item.date, tone: item.tone })),
-  ]
-  if (insightsRange === 'year' || insightsRange === 'month') {
-    const targetCellCount = insightsRange === 'year' ? 53 * 7 : 6 * 7
-    const trailingCells = targetCellCount - heatmapCells.length
-    heatmapCells.push(
-      ...Array.from({ length: trailingCells }, (_, index) => ({
-        key: `trailing-${index}`,
-        date: null,
-        tone: 'spacer',
-      })),
-    )
+  const periodAt = (offset: PeriodOffset) =>
+    offset === 0
+      ? currentPeriod
+      : buildInsightsPeriod(insightsRange, shiftRange(insightsRange, insightsAnchor, offset), entryMap, todayDateKey)
+
+  const stepInsightsAnchor = (direction: -1 | 1) => {
+    setInsightsAnchor((current) => shiftRange(insightsRange, current, direction))
   }
+
+  const renderBedtimePeriod = (period: InsightsPeriod, offset: PeriodOffset) => (
+    <div className="period-body">
+      <div className="chart-area">
+        <div className="time-axis-labels" role="group" aria-label="Bedtime axis times">
+          {period.bedtimeTicks.map((tick) => <span key={tick}>{formatMinutesAsTime(tick)}</span>)}
+        </div>
+        <div className="chart-wrap">
+          <ResponsiveContainer width="100%" height={248}>
+            <AreaChart data={period.chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+              <defs>
+                <linearGradient id={`bedtimeFill-${offset}`} x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor="#c6d5ec" stopOpacity={0.58} />
+                  <stop offset="95%" stopColor="#c6d5ec" stopOpacity={0.04} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid stroke="rgba(148, 163, 184, 0.22)" strokeDasharray="4 4" />
+              <XAxis dataKey="label" tick={{ fill: 'var(--muted)', fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={18} />
+              <YAxis
+                dataKey="bedtime"
+                type="number"
+                domain={period.bedtimeDomain}
+                ticks={period.bedtimeTicks}
+                reversed
+                tick={false}
+                tickLine={false}
+                axisLine={false}
+                width={0}
+              />
+              <Tooltip
+                formatter={(value) => (typeof value === 'number' ? formatMinutesAsTime(value) : String(value ?? ''))}
+                labelFormatter={(_, payload) => {
+                  const date = payload?.[0]?.payload?.date
+                  return typeof date === 'string' ? formatDisplayDate(toDateFromKey(date)) : ''
+                }}
+              />
+              <Area type="monotone" dataKey="bedtime" stroke="#c6d5ec" fill={`url(#bedtimeFill-${offset})`} strokeWidth={2} connectNulls={false} />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+      <p className="range-caption">{period.rangeLabel}</p>
+    </div>
+  )
+
+  const renderRoutinePeriod = (period: InsightsPeriod) => (
+    <div className="period-body">
+      {period.range === 'month' && (
+        <div className="heatmap-month-labels" aria-hidden="true">
+          {weekdayLabels.map((day) => <span key={day}>{day}</span>)}
+        </div>
+      )}
+      <HeatmapGrid cells={period.heatmapCells} range={period.range} onSelectDate={handleDateSelect} />
+      <p className="range-caption">{period.rangeLabel}</p>
+    </div>
+  )
 
   const handleThemeToggle = () => {
     setTheme((current) => {
@@ -824,15 +1008,8 @@ function App() {
     })
   }
 
-  const moveRoutineStep = async (stepId: string, direction: number) => {
-    if (cloudLoading) return
-    const index = routineSteps.findIndex((step) => step.id === stepId)
-    const targetIndex = index + direction
-    if (index < 0 || targetIndex < 0 || targetIndex >= routineSteps.length) return
-    const nextSteps = [...routineSteps]
-    const [item] = nextSteps.splice(index, 1)
-    nextSteps.splice(targetIndex, 0, item)
-    const reordered = nextSteps.map((step, stepIndex) => ({ ...step, order: stepIndex + 1 }))
+  const persistRoutineOrder = async (nextOrder: RoutineStep[], fallbackOrder: RoutineStep[]) => {
+    const reordered = nextOrder.map((step, stepIndex) => ({ ...step, order: stepIndex + 1 }))
     if (supabase && authUser && cloudDataActive) {
       try {
         const { error } = await supabase.from('routine_steps').upsert(
@@ -847,10 +1024,40 @@ function App() {
         if (error) throw error
       } catch (error) {
         setCloudError(`Could not reorder routine steps: ${error instanceof Error ? error.message : String(error)}`)
+        setRoutineSteps(fallbackOrder)
         return
       }
     }
     setRoutineSteps(reordered)
+  }
+
+  // Drag reorders update the list live; the order is saved once, on drop, and rolled back if the save fails.
+  const routineDragRef = useRef<{ start: RoutineStep[]; latest: RoutineStep[] | null } | null>(null)
+
+  const handleRoutineDragStart = () => {
+    routineDragRef.current = { start: routineSteps, latest: null }
+  }
+
+  const handleRoutineReorder = (nextOrder: RoutineStep[]) => {
+    if (routineDragRef.current) routineDragRef.current.latest = nextOrder
+    setRoutineSteps(nextOrder)
+  }
+
+  const handleRoutineDragEnd = () => {
+    const drag = routineDragRef.current
+    routineDragRef.current = null
+    if (drag?.latest) void persistRoutineOrder(drag.latest, drag.start)
+  }
+
+  const moveRoutineStep = (stepId: string, direction: -1 | 1) => {
+    if (cloudLoading) return
+    const index = routineSteps.findIndex((step) => step.id === stepId)
+    const targetIndex = index + direction
+    if (index < 0 || targetIndex < 0 || targetIndex >= routineSteps.length) return
+    const nextOrder = [...routineSteps]
+    const [item] = nextOrder.splice(index, 1)
+    nextOrder.splice(targetIndex, 0, item)
+    void persistRoutineOrder(nextOrder, routineSteps)
   }
 
   const toggleChecklistItem = async (stepId: string) => {
@@ -1148,57 +1355,24 @@ function App() {
                       ))}
                     </div>
                     <div className="nav-buttons">
-                      <button type="button" className="icon-button" onClick={() => setInsightsAnchor((current) => shiftRange(insightsRange, current, -1))} aria-label="Previous range">
+                      <button type="button" className="icon-button" onClick={() => stepInsightsAnchor(-1)} aria-label="Previous range">
                         <ChevronLeft size={16} />
                       </button>
                       <button type="button" className="ghost-button" onClick={() => setInsightsAnchor(toDateFromKey(todayDateKey))}>
                         Current {insightsRange}
                       </button>
-                      <button type="button" className="icon-button" onClick={() => setInsightsAnchor((current) => shiftRange(insightsRange, current, 1))} disabled={!canAdvanceRange()} aria-label="Next range">
+                      <button type="button" className="icon-button" onClick={() => stepInsightsAnchor(1)} disabled={!canAdvanceRange()} aria-label="Next range">
                         <ChevronRight size={16} />
                       </button>
                     </div>
                   </div>
 
-                  <div className="chart-area">
-                    <div className="time-axis-labels" role="group" aria-label="Bedtime axis times">
-                      {bedtimeTicks.map((tick) => <span key={tick}>{formatMinutesAsTime(tick)}</span>)}
-                    </div>
-                    <div className="chart-wrap">
-                      <ResponsiveContainer width="100%" height={248}>
-                        <AreaChart data={chartData}>
-                          <defs>
-                            <linearGradient id="bedtimeFill" x1="0" y1="0" x2="0" y2="1">
-                              <stop offset="5%" stopColor="#c6d5ec" stopOpacity={0.58} />
-                              <stop offset="95%" stopColor="#c6d5ec" stopOpacity={0.04} />
-                            </linearGradient>
-                          </defs>
-                          <CartesianGrid stroke="rgba(148, 163, 184, 0.22)" strokeDasharray="4 4" />
-                          <XAxis dataKey="label" tick={{ fill: 'var(--muted)', fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={18} />
-                          <YAxis
-                            dataKey="bedtime"
-                            type="number"
-                            domain={bedtimeDomain}
-                            ticks={bedtimeTicks}
-                            reversed
-                            tick={false}
-                            tickLine={false}
-                            axisLine={false}
-                            width={0}
-                          />
-                          <Tooltip
-                            formatter={(value) => (typeof value === 'number' ? formatMinutesAsTime(value) : String(value ?? ''))}
-                            labelFormatter={(_, payload) => {
-                              const date = payload?.[0]?.payload?.date
-                              return typeof date === 'string' ? formatDisplayDate(toDateFromKey(date)) : ''
-                            }}
-                          />
-                          <Area type="monotone" dataKey="bedtime" stroke="#c6d5ec" fill="url(#bedtimeFill)" strokeWidth={2} connectNulls={false} />
-                        </AreaChart>
-                      </ResponsiveContainer>
-                    </div>
-                  </div>
-                  <p className="range-caption">{formatDisplayDate(rangeInfo.start)}–{formatDisplayDate(rangeInfo.end)}</p>
+                  <PeriodStrip
+                    periodKey={`bedtime-${insightsRange}-${getLocalDateKey(insightsAnchor)}`}
+                    canAdvance={canAdvanceRange()}
+                    onStep={stepInsightsAnchor}
+                    renderPeriod={(offset) => renderBedtimePeriod(periodAt(offset), offset)}
+                  />
                 </div>
 
                 <div className="panel-card chart-card">
@@ -1222,43 +1396,24 @@ function App() {
                       ))}
                     </div>
                     <div className="nav-buttons">
-                      <button type="button" className="icon-button" onClick={() => setInsightsAnchor((current) => shiftRange(insightsRange, current, -1))} aria-label="Previous range">
+                      <button type="button" className="icon-button" onClick={() => stepInsightsAnchor(-1)} aria-label="Previous range">
                         <ChevronLeft size={16} />
                       </button>
                       <button type="button" className="ghost-button" onClick={() => setInsightsAnchor(toDateFromKey(todayDateKey))}>
                         Current {insightsRange}
                       </button>
-                      <button type="button" className="icon-button" onClick={() => setInsightsAnchor((current) => shiftRange(insightsRange, current, 1))} disabled={!canAdvanceRange()} aria-label="Next range">
+                      <button type="button" className="icon-button" onClick={() => stepInsightsAnchor(1)} disabled={!canAdvanceRange()} aria-label="Next range">
                         <ChevronRight size={16} />
                       </button>
                     </div>
                   </div>
-                  {insightsRange === 'month' && (
-                    <div className="heatmap-month-labels">
-                      {weekdayLabels.map((day) => <span key={day}>{day}</span>)}
-                    </div>
-                  )}
-                  <div className={insightsRange === 'year' ? 'heatmap-year-layout' : undefined}>
-                    {insightsRange === 'year' && (
-                      <div className="heatmap-year-labels" aria-hidden="true">
-                        <span>Mon</span><span>Wed</span><span>Fri</span>
-                      </div>
-                    )}
-                    <div className={`heatmap-grid ${insightsRange}`} style={insightsRange === 'year' ? { gridTemplateRows: 'repeat(7, minmax(0, 1fr))' } : { gridTemplateColumns: `repeat(${insightsRange === 'day' ? 1 : 7}, minmax(0, 1fr))` }}>
-                      {heatmapCells.map((item) => item.date !== null ? (
-                        <button
-                          key={item.key}
-                          type="button"
-                          className={`heat-tile ${item.tone}`}
-                          aria-label={`${item.date}: ${item.tone === 'done' ? 'wind-down completed' : item.tone === 'missed' ? 'wind-down not completed' : 'no entry'}`}
-                          onClick={() => handleDateSelect(item.date)}
-                          title={`${formatDisplayDate(toDateFromKey(item.date))}: ${item.tone === 'done' ? 'completed' : item.tone === 'missed' ? 'not completed' : 'no entry'}`}
-                        />
-                      ) : (
-                        <span key={item.key} className={`heat-tile ${item.tone}`} aria-hidden="true" />
-                      ))}
-                    </div>
-                  </div>
+
+                  <PeriodStrip
+                    periodKey={`routine-${insightsRange}-${getLocalDateKey(insightsAnchor)}`}
+                    canAdvance={canAdvanceRange()}
+                    onStep={stepInsightsAnchor}
+                    renderPeriod={(offset) => renderRoutinePeriod(periodAt(offset))}
+                  />
                   <div className="heatmap-legend">
                     <span><i className="legend-tile done" /> Completed</span>
                     <span><i className="legend-tile missed" /> Not completed</span>
@@ -1270,23 +1425,25 @@ function App() {
               <aside className="metrics-panel">
                 <div className="panel-card insight-card">
                   <div>
-                    <p className="eyebrow">Typical bedtime</p>
-                    <strong>{avgBedtime}</strong>
-                    <span>Across {rangeEntries.length} logged {rangeEntries.length === 1 ? 'evening' : 'evenings'} in this period.</span>
+                    <p className="eyebrow">Typical bedtime · {currentPeriod.windowLabel}</p>
+                    <strong>{currentPeriod.avgBedtime}</strong>
+                    <span>Across {currentPeriod.loggedEntries.length} logged {currentPeriod.loggedEntries.length === 1 ? 'evening' : 'evenings'} in this period.</span>
+                    <span className="insight-range">{currentPeriod.rangeLabel}</span>
                   </div>
                 </div>
                 <div className="panel-card insight-card">
                   <div>
-                    <p className="eyebrow">Routine rhythm</p>
-                    <strong>{rangeEntries.length ? `${completionRate}%` : 'No entries'}</strong>
-                    <span>Wind-down completion for {formatDisplayDate(rangeInfo.start)}–{formatDisplayDate(rangeInfo.end)}.</span>
+                    <p className="eyebrow">Routine rhythm · {currentPeriod.windowLabel}</p>
+                    <strong>{currentPeriod.loggedEntries.length ? `${currentPeriod.completionRate}%` : 'No entries'}</strong>
+                    <span>Wind-down completion for {currentPeriod.rangeLabel}.</span>
                   </div>
                 </div>
                 <div className="panel-card insight-card">
                   <div>
-                    <p className="eyebrow">Logged evenings</p>
-                    <strong>{rangeEntries.length}</strong>
+                    <p className="eyebrow">Logged evenings · {currentPeriod.windowLabel}</p>
+                    <strong>{currentPeriod.loggedEntries.length}</strong>
                     <span>Evening bedtime records in the selected period.</span>
+                    <span className="insight-range">{currentPeriod.rangeLabel}</span>
                   </div>
                 </div>
               </aside>
@@ -1323,34 +1480,24 @@ function App() {
                   </button>
                 </form>
 
-                <div className="checklist-list">
-                  {routineSteps.length ? (
-                    routineSteps.map((step) => {
-                      const isComplete = Boolean(dailyChecklist[selectedDate]?.[step.id])
-                      return (
-                        <div key={step.id} className={`checklist-item ${isComplete ? 'complete' : ''}`}>
-                          <button type="button" className="check-toggle" onClick={() => toggleChecklistItem(step.id)} aria-label={`${isComplete ? 'Mark incomplete' : 'Mark complete'} ${step.label}`}>
-                            {isComplete ? <Check size={14} /> : <CircleDashed size={14} />}
-                          </button>
-                          <span>{step.label}</span>
-                          <div className="checklist-actions">
-                            <button type="button" className="icon-button" onClick={() => moveRoutineStep(step.id, -1)} aria-label={`Move ${step.label} up`}>
-                              <ChevronLeft size={14} />
-                            </button>
-                            <button type="button" className="icon-button" onClick={() => moveRoutineStep(step.id, 1)} aria-label={`Move ${step.label} down`}>
-                              <ChevronRight size={14} />
-                            </button>
-                            <button type="button" className="icon-button danger" onClick={() => handleDeleteRoutineStep(step.id)} aria-label={`Delete ${step.label}`}>
-                              <Trash2 size={14} />
-                            </button>
-                          </div>
-                        </div>
-                      )
-                    })
-                  ) : (
-                    <div className="empty-panel">No routine steps yet. Add one to start your evening sequence.</div>
-                  )}
-                </div>
+                {routineSteps.length ? (
+                  <Reorder.Group as="div" axis="y" values={routineSteps} onReorder={handleRoutineReorder} className="checklist-list">
+                    {routineSteps.map((step) => (
+                      <RoutineStepRow
+                        key={step.id}
+                        step={step}
+                        isComplete={Boolean(dailyChecklist[selectedDate]?.[step.id])}
+                        onToggle={() => toggleChecklistItem(step.id)}
+                        onDelete={() => handleDeleteRoutineStep(step.id)}
+                        onMove={(direction) => moveRoutineStep(step.id, direction)}
+                        onDragStart={handleRoutineDragStart}
+                        onDragEnd={handleRoutineDragEnd}
+                      />
+                    ))}
+                  </Reorder.Group>
+                ) : (
+                  <div className="empty-panel">No routine steps yet. Add one to start your evening sequence.</div>
+                )}
               </div>
 
               <aside className="panel-card side-panel routine-side">
