@@ -1785,7 +1785,7 @@ function App() {
                       <h2>Hours slept</h2>
                     </div>
                   </div>
-                  <div className="toolbar">
+                  <div className="toolbar sleep-toolbar">
                     <div className="segmented-control" aria-label="Sleep range selector">
                       {(['day', 'week', 'month', 'year'] as RangeKind[]).map((option) => (
                         <button

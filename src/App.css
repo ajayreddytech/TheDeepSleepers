@@ -1213,6 +1213,16 @@ body {
     font-size: 0.95rem;
   }
 
+  /* On phones, the sleep graph's Current/arrow controls drop to their own row under the range tabs. */
+  .sleep-toolbar {
+    flex-wrap: wrap;
+  }
+
+  .sleep-toolbar .nav-buttons {
+    width: 100%;
+    justify-content: space-between;
+  }
+
   .calendar-cell {
     min-height: 68px;
     padding: 0.35rem;
