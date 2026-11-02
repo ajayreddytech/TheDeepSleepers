@@ -1321,6 +1321,7 @@ function App() {
               strokeWidth={2}
               dot={period.chartData.length > 62 ? false : { r: 3, fill: '#f0c871' }}
               connectNulls={false}
+              isAnimationActive={false}
             />
           </LineChart>
         </ResponsiveContainer>
@@ -1580,7 +1581,7 @@ function App() {
                       <h2>Bedtime rhythm</h2>
                     </div>
                   </div>
-                  <div className="toolbar">
+                  <div className="toolbar insights-toolbar">
                     <div className="segmented-control" aria-label="Bedtime range selector">
                       {(['day', 'week', 'month', 'year'] as RangeKind[]).map((option) => (
                         <button
@@ -1621,7 +1622,7 @@ function App() {
                       <h2>Routine completion</h2>
                     </div>
                   </div>
-                  <div className="toolbar">
+                  <div className="toolbar insights-toolbar">
                     <div className="segmented-control" aria-label="Routine range selector">
                       {(['day', 'week', 'month', 'year'] as RangeKind[]).map((option) => (
                         <button
