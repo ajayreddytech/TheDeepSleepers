@@ -4,8 +4,8 @@
 // that evening; its wake-up time is the wake-up app's log for the following calendar date.
 // When no wake-up time has been logged yet, the night has no hours and stays empty.
 
-export const TARGET_SLEEP_HOURS = 8
-export const MIN_SLEEP_HOURS = 7
+export const TARGET_SLEEP_HOURS = 6.5
+export const MIN_SLEEP_HOURS = 6
 
 const MINUTES_PER_DAY = 24 * 60
 // Bedtimes before noon belong to the previous evening (same rule as the rest of the app).

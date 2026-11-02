@@ -1204,8 +1204,13 @@ body {
   .settings-actions,
   .toolbar,
   .calendar-toolbar {
-    flex-direction: column;
-    align-items: stretch;
+    flex-wrap: nowrap;
+    gap: 0.5rem;
+  }
+
+  .calendar-toolbar strong {
+    min-width: 0;
+    font-size: 0.95rem;
   }
 
   .calendar-cell {

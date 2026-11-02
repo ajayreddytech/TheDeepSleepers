@@ -1290,9 +1290,10 @@ function App() {
 
   const renderSleepPeriod = (period: SleepPeriod) => (
     <div className="period-body">
-      <div className="chart-wrap">
-        <ResponsiveContainer width="100%" height={248}>
-          <LineChart data={period.chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+      <div className="chart-area">
+        <div className="chart-wrap">
+          <ResponsiveContainer width="100%" height={248}>
+            <LineChart data={period.chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
             <CartesianGrid stroke="rgba(148, 163, 184, 0.22)" strokeDasharray="4 4" />
             <XAxis dataKey="label" tick={{ fill: 'var(--muted)', fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={18} />
             <YAxis
@@ -1323,6 +1324,7 @@ function App() {
             />
           </LineChart>
         </ResponsiveContainer>
+        </div>
       </div>
       <p className="range-caption">{period.rangeLabel}</p>
     </div>
