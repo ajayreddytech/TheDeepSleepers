@@ -728,6 +728,32 @@ function App() {
     }
   }, [])
 
+  // Silent single sign-on for the wake-up project: if the main account is signed in and this tab has no
+  // wake-up session, try Google once with prompt=none and the main account's email. Google skips the account
+  // chooser when the browser already has that account. Tried once per tab so a failure can't loop.
+  const mainAccountEmail = authUser?.email ?? null
+  useEffect(() => {
+    const client = wakeSupabase
+    if (!client || !mainAccountEmail) return
+    const attemptedKey = 'the-deep-sleepers.wake-silent-attempted'
+    if (window.sessionStorage.getItem(attemptedKey)) return
+    let isMounted = true
+    void client.auth.getSession().then(({ data }) => {
+      if (!isMounted || data.session) return
+      window.sessionStorage.setItem(attemptedKey, '1')
+      void client.auth.signInWithOAuth({
+        provider: 'google',
+        options: {
+          redirectTo: window.location.origin,
+          queryParams: { prompt: 'none', login_hint: mainAccountEmail },
+        },
+      })
+    })
+    return () => {
+      isMounted = false
+    }
+  }, [mainAccountEmail])
+
   // Wake-up times are read every time the Sleep tab opens, so the calendar, graph and insights stay current.
   const wakeUserId = wakeUser?.id
   useEffect(() => {
@@ -1222,7 +1248,10 @@ function App() {
     try {
       const { error } = await wakeSupabase.auth.signInWithOAuth({
         provider: 'google',
-        options: { redirectTo: window.location.origin },
+        options: {
+          redirectTo: window.location.origin,
+          queryParams: authUser?.email ? { login_hint: authUser.email } : undefined,
+        },
       })
       if (error) throw error
     } catch (error) {
