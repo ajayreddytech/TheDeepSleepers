@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { Reorder, motion, useDragControls } from 'framer-motion'
 import {
   BarChart3,
+  BedDouble,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -28,6 +29,9 @@ import {
   Area,
   AreaChart,
   CartesianGrid,
+  Line,
+  LineChart,
+  ReferenceLine,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -36,10 +40,22 @@ import {
 import type { User } from '@supabase/supabase-js'
 import { HeatmapGrid, type HeatmapCell } from './components/HeatmapGrid'
 import { PeriodStrip } from './components/PeriodStrip'
+import {
+  MIN_SLEEP_HOURS,
+  TARGET_SLEEP_HOURS,
+  buildSleepNights,
+  computeSleepStats,
+  formatHoursLong,
+  formatHoursShort,
+  formatMinutesOfClock,
+  type SleepNight,
+  type SleepStats,
+} from './lib/sleep'
 import { supabase, supabaseConfigured } from './lib/supabase'
+import { wakeSupabase, wakeSupabaseConfigured } from './lib/wakeSupabase'
 import './App.css'
 
-type NavTab = 'daily' | 'history' | 'insights' | 'routine' | 'settings'
+type NavTab = 'daily' | 'history' | 'insights' | 'sleep' | 'routine' | 'settings'
 type RangeKind = 'day' | 'week' | 'month' | 'year'
 type ThemeMode = 'light' | 'dark' | 'system'
 
@@ -84,6 +100,7 @@ const navItems: { id: NavTab; label: string; icon: typeof Home }[] = [
   { id: 'history', label: 'History', icon: History },
   { id: 'insights', label: 'Insights', icon: BarChart3 },
   { id: 'routine', label: 'My routine', icon: ListTodo },
+  { id: 'sleep', label: 'Sleep', icon: BedDouble },
   { id: 'settings', label: 'Settings', icon: Settings },
 ]
 
@@ -386,6 +403,43 @@ function buildInsightsPeriod(
   }
 }
 
+type SleepPeriod = {
+  windowLabel: string
+  rangeLabel: string
+  chartData: { date: string; label: string; hours: number | null }[]
+  yDomain: [number, number]
+  nights: SleepNight[]
+  stats: SleepStats
+}
+
+function buildSleepPeriod(
+  range: RangeKind,
+  anchor: Date,
+  nightMap: Record<string, SleepNight>,
+  todayKey: string,
+): SleepPeriod {
+  const info = getRangeDates(range, anchor)
+  const today = toDateFromKey(todayKey)
+  const isCurrent = info.start <= today && today <= info.end
+  const chartData = info.dates.map((dateKey) => ({
+    date: dateKey,
+    label: formatDateLabel(dateKey),
+    hours: nightMap[dateKey]?.hours ?? null,
+  }))
+  const nights = info.dates.map((dateKey) => nightMap[dateKey]).filter((night): night is SleepNight => Boolean(night))
+  const peakHours = Math.max(0, ...chartData.map((point) => point.hours ?? 0))
+  const yMaximum = Math.max(TARGET_SLEEP_HOURS + 2, Math.ceil(peakHours) + 1)
+
+  return {
+    windowLabel: isCurrent ? CURRENT_WINDOW_LABELS[range] : PAST_WINDOW_LABELS[range],
+    rangeLabel: `${formatDisplayDate(info.start)}–${formatDisplayDate(info.end)}`,
+    chartData,
+    yDomain: [0, yMaximum],
+    nights,
+    stats: computeSleepStats(nights),
+  }
+}
+
 type RoutineStepRowProps = {
   step: RoutineStep
   isComplete: boolean
@@ -467,6 +521,14 @@ function App() {
   const [routineField, setRoutineField] = useState('')
   const [insightsRange, setInsightsRange] = useState<RangeKind>('month')
   const [insightsAnchor, setInsightsAnchor] = useState(() => new Date())
+  const [sleepRange, setSleepRange] = useState<RangeKind>('month')
+  const [sleepAnchor, setSleepAnchor] = useState(() => new Date())
+  const [sleepCalendarMonth, setSleepCalendarMonth] = useState(() => getMonthStart(new Date()))
+  const [wakeUser, setWakeUser] = useState<User | null>(null)
+  const [wakeTimes, setWakeTimes] = useState<Record<string, string>>({})
+  const [wakeStatus, setWakeStatus] = useState<'idle' | 'ready' | 'error'>('idle')
+  const [wakeError, setWakeError] = useState('')
+  const [wakeBusy, setWakeBusy] = useState(false)
   const [authUser, setAuthUser] = useState<User | null>(null)
   const [cloudDataActive, setCloudDataActive] = useState(false)
   const [cloudLoading, setCloudLoading] = useState(false)
@@ -649,6 +711,62 @@ function App() {
     const shouldUseDark = theme === 'system' ? systemPrefersDark : theme === 'dark'
     document.documentElement.dataset.theme = shouldUseDark ? 'dark' : 'light'
   }, [theme])
+
+  useEffect(() => {
+    const client = wakeSupabase
+    if (!client) return
+    let isMounted = true
+    void client.auth.getSession().then(({ data }) => {
+      if (isMounted) setWakeUser(data.session?.user ?? null)
+    })
+    const { data: { subscription } } = client.auth.onAuthStateChange((_event, session) => {
+      setWakeUser(session?.user ?? null)
+    })
+    return () => {
+      isMounted = false
+      subscription.unsubscribe()
+    }
+  }, [])
+
+  // Wake-up times are read every time the Sleep tab opens, so the calendar, graph and insights stay current.
+  const wakeUserId = wakeUser?.id
+  useEffect(() => {
+    const client = wakeSupabase
+    if (activeTab !== 'sleep' || !client || !wakeUserId) return
+    let isMounted = true
+    void client
+      .from('daily_logs')
+      .select('log_date, wake_up_time')
+      .then(({ data, error }) => {
+        if (!isMounted) return
+        if (error) {
+          setWakeStatus('error')
+          setWakeError(`Could not read wake-up times: ${error.message}`)
+          return
+        }
+        const next: Record<string, string> = {}
+        for (const row of data ?? []) {
+          // A missing or empty wake-up time means the morning has not been logged yet.
+          if (row.wake_up_time) next[row.log_date] = String(row.wake_up_time).slice(0, 5)
+        }
+        setWakeError('')
+        setWakeTimes(next)
+        setWakeStatus('ready')
+      })
+    return () => {
+      isMounted = false
+    }
+  }, [activeTab, wakeUserId])
+
+  const sleepNightMap = useMemo(() => buildSleepNights(entries, wakeTimes), [entries, wakeTimes])
+
+  const sleepPeriodAt = (offset: PeriodOffset) =>
+    buildSleepPeriod(
+      sleepRange,
+      offset === 0 ? sleepAnchor : shiftRange(sleepRange, sleepAnchor, offset),
+      sleepNightMap,
+      todayDateKey,
+    )
 
   const currentPeriod = useMemo(
     () => buildInsightsPeriod(insightsRange, insightsAnchor, entryMap, todayDateKey),
@@ -1092,6 +1210,95 @@ function App() {
     return nextRange.start <= toDateFromKey(todayDateKey)
   }
 
+  const canAdvanceSleep = () => {
+    const nextAnchor = shiftRange(sleepRange, sleepAnchor, 1)
+    return getRangeDates(sleepRange, nextAnchor).start <= toDateFromKey(todayDateKey)
+  }
+
+  const handleConnectWakeApp = async () => {
+    if (!wakeSupabase) return
+    setWakeBusy(true)
+    setWakeError('')
+    try {
+      const { error } = await wakeSupabase.auth.signInWithOAuth({
+        provider: 'google',
+        options: { redirectTo: window.location.origin },
+      })
+      if (error) throw error
+    } catch (error) {
+      setWakeError(`Wake-up app sign-in could not be started: ${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setWakeBusy(false)
+    }
+  }
+
+  const handleDisconnectWakeApp = async () => {
+    if (!wakeSupabase) return
+    setWakeBusy(true)
+    setWakeError('')
+    try {
+      // Local scope signs this device out of the wake-up project only; the main account stays signed in.
+      const { error } = await wakeSupabase.auth.signOut({ scope: 'local' })
+      if (error) throw error
+      setWakeUser(null)
+      setWakeTimes({})
+      setWakeStatus('idle')
+    } catch (error) {
+      setWakeError(`Could not disconnect the wake-up app: ${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setWakeBusy(false)
+    }
+  }
+
+  const stepSleepAnchor = (direction: -1 | 1) => {
+    setSleepAnchor((current) => shiftRange(sleepRange, current, direction))
+  }
+
+  const currentSleep = sleepPeriodAt(0)
+  const sleepStats = currentSleep.stats
+  const todayDate = toDateFromKey(todayDateKey)
+  const nextSleepMonthAvailable = addMonths(sleepCalendarMonth, 1) <= getMonthStart(todayDate)
+
+  const renderSleepPeriod = (period: SleepPeriod) => (
+    <div className="period-body">
+      <div className="chart-wrap">
+        <ResponsiveContainer width="100%" height={248}>
+          <LineChart data={period.chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+            <CartesianGrid stroke="rgba(148, 163, 184, 0.22)" strokeDasharray="4 4" />
+            <XAxis dataKey="label" tick={{ fill: 'var(--muted)', fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={18} />
+            <YAxis
+              domain={period.yDomain}
+              allowDecimals={false}
+              tickFormatter={(value: number) => `${value}h`}
+              tick={{ fill: 'var(--muted)', fontSize: 12 }}
+              tickLine={false}
+              axisLine={false}
+              width={40}
+            />
+            <ReferenceLine y={TARGET_SLEEP_HOURS} stroke="rgba(240, 200, 113, 0.55)" strokeDasharray="6 4" />
+            <Tooltip
+              formatter={(value) => (typeof value === 'number' ? formatHoursLong(value) : 'No hours yet')}
+              labelFormatter={(_, payload) => {
+                const date = payload?.[0]?.payload?.date
+                return typeof date === 'string' ? formatDisplayDate(toDateFromKey(date)) : ''
+              }}
+            />
+            <Line
+              type="monotone"
+              dataKey="hours"
+              name="Sleep"
+              stroke="#f0c871"
+              strokeWidth={2}
+              dot={period.chartData.length > 62 ? false : { r: 3, fill: '#f0c871' }}
+              connectNulls={false}
+            />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+      <p className="range-caption">{period.rangeLabel}</p>
+    </div>
+  )
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -1126,6 +1333,7 @@ function App() {
               {activeTab === 'daily' && 'Good evening'}
               {activeTab === 'history' && 'History'}
               {activeTab === 'insights' && 'Insights'}
+              {activeTab === 'sleep' && 'Sleep'}
               {activeTab === 'routine' && 'My routine'}
               {activeTab === 'settings' && 'Settings'}
             </h1>
@@ -1444,6 +1652,218 @@ function App() {
                     <strong>{currentPeriod.loggedEntries.length}</strong>
                     <span>Evening bedtime records in the selected period.</span>
                     <span className="insight-range">{currentPeriod.rangeLabel}</span>
+                  </div>
+                </div>
+              </aside>
+            </section>
+          )}
+
+          {activeTab === 'sleep' && (
+            <section className="panel insights-layout sleep-layout">
+              <div className="insights-main">
+                <div className="panel-card wake-status">
+                  <div>
+                    <p className="eyebrow">Wake-up data</p>
+                    <p className="settings-copy">
+                      {!wakeSupabaseConfigured
+                        ? 'The wake-up app is not configured for this build. Add its URL and key to the deployment environment, then rebuild.'
+                        : wakeUser
+                          ? `Connected as ${wakeUser.email ?? 'Google account'}. Sleep hours fill in once the morning after a night is logged.`
+                          : 'Connect the wake-up app to calculate sleep hours from your logged wake-up times.'}
+                    </p>
+                    {wakeSupabaseConfigured && wakeUser && wakeStatus === 'idle' && (
+                      <p className="settings-hint" role="status">Reading wake-up times…</p>
+                    )}
+                    {wakeError && <p className="cloud-alert" role="alert">{wakeError}</p>}
+                  </div>
+                  {wakeSupabaseConfigured && (
+                    wakeUser ? (
+                      <button type="button" className="ghost-button" onClick={handleDisconnectWakeApp} disabled={wakeBusy}>
+                        <LogOut size={16} />
+                        Disconnect
+                      </button>
+                    ) : (
+                      <button type="button" className="primary-button" onClick={handleConnectWakeApp} disabled={wakeBusy}>
+                        <ShieldCheck size={16} />
+                        {wakeBusy ? 'Connecting…' : 'Connect wake-up app'}
+                      </button>
+                    )
+                  )}
+                </div>
+
+                <div className="panel-card calendar-card">
+                  <div className="section-header compact">
+                    <div>
+                      <p className="eyebrow">Sleep calendar</p>
+                      <h2>Hours slept each night</h2>
+                    </div>
+                  </div>
+                  <div className="calendar-toolbar">
+                    <button type="button" className="icon-button" onClick={() => setSleepCalendarMonth(addMonths(sleepCalendarMonth, -1))} aria-label="Previous month">
+                      <ChevronLeft size={16} />
+                    </button>
+                    <strong>{formatMonthLabel(sleepCalendarMonth)}</strong>
+                    <button type="button" className="icon-button" onClick={() => setSleepCalendarMonth(addMonths(sleepCalendarMonth, 1))} disabled={!nextSleepMonthAvailable} aria-label="Next month">
+                      <ChevronRight size={16} />
+                    </button>
+                    <button type="button" className="ghost-button" onClick={() => setSleepCalendarMonth(getMonthStart(todayDate))}>
+                      Today
+                    </button>
+                  </div>
+
+                  <div className="weekday-row">
+                    {weekdayLabels.map((day) => (
+                      <span key={day}>{day}</span>
+                    ))}
+                  </div>
+
+                  <div className="calendar-grid">
+                    {Array.from({ length: getMonthGridOffset(sleepCalendarMonth) }, (_, index) => (
+                      <div key={`sleep-placeholder-${index}`} className="calendar-cell placeholder" aria-hidden="true" />
+                    ))}
+
+                    {Array.from({ length: new Date(sleepCalendarMonth.getFullYear(), sleepCalendarMonth.getMonth() + 1, 0).getDate() }, (_, index) => {
+                      const date = new Date(sleepCalendarMonth.getFullYear(), sleepCalendarMonth.getMonth(), index + 1)
+                      const dateKey = getLocalDateKey(date)
+                      const night = sleepNightMap[dateKey]
+                      const hours = night?.hours ?? null
+                      const tone = hours === null ? 'unmeasured' : hours >= MIN_SLEEP_HOURS ? 'rested' : 'short'
+                      const tooltip = night
+                        ? `Bed ${formatTimeAsClock(night.bedtime)} · Wake ${night.wakeTime ? formatTimeAsClock(night.wakeTime) : 'not logged yet'}`
+                        : 'No bedtime logged'
+
+                      return (
+                        <div
+                          key={dateKey}
+                          className={`calendar-cell sleep-day ${tone} ${dateKey === todayDateKey ? 'today' : ''} ${dateKey > todayDateKey ? 'future' : ''}`}
+                          title={tooltip}
+                          aria-label={`${formatDisplayDate(date)}: ${hours === null ? 'no sleep hours yet' : formatHoursLong(hours)}. ${tooltip}`}
+                        >
+                          <span className="calendar-date">{date.getDate()}</span>
+                          <span className="sleep-hours">{hours === null ? '—' : formatHoursShort(hours)}</span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+
+                <div className="panel-card chart-card">
+                  <div className="section-header compact">
+                    <div>
+                      <p className="eyebrow">Sleep graph</p>
+                      <h2>Hours slept</h2>
+                    </div>
+                  </div>
+                  <div className="toolbar">
+                    <div className="segmented-control" aria-label="Sleep range selector">
+                      {(['day', 'week', 'month', 'year'] as RangeKind[]).map((option) => (
+                        <button
+                          key={option}
+                          type="button"
+                          className={sleepRange === option ? 'selected' : ''}
+                          onClick={() => setSleepRange(option)}
+                        >
+                          {option[0].toUpperCase() + option.slice(1)}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="nav-buttons">
+                      <button type="button" className="icon-button" onClick={() => stepSleepAnchor(-1)} aria-label="Previous range">
+                        <ChevronLeft size={16} />
+                      </button>
+                      <button type="button" className="ghost-button" onClick={() => setSleepAnchor(toDateFromKey(todayDateKey))}>
+                        Current {sleepRange}
+                      </button>
+                      <button type="button" className="icon-button" onClick={() => stepSleepAnchor(1)} disabled={!canAdvanceSleep()} aria-label="Next range">
+                        <ChevronRight size={16} />
+                      </button>
+                    </div>
+                  </div>
+
+                  <PeriodStrip
+                    periodKey={`sleep-${sleepRange}-${getLocalDateKey(sleepAnchor)}`}
+                    canAdvance={canAdvanceSleep()}
+                    onStep={stepSleepAnchor}
+                    renderPeriod={(offset) => renderSleepPeriod(sleepPeriodAt(offset))}
+                  />
+                  <p className="settings-hint">The dashed line marks the {TARGET_SLEEP_HOURS}-hour target. Gaps mean no wake-up or bedtime is logged for that night.</p>
+                </div>
+              </div>
+
+              <aside className="metrics-panel">
+                <div className="panel-card insight-card">
+                  <div>
+                    <p className="eyebrow">Average sleep · {currentSleep.windowLabel}</p>
+                    <strong>{sleepStats.averageHours !== null ? formatHoursLong(sleepStats.averageHours) : 'No sleep data'}</strong>
+                    <span>
+                      {sleepStats.measuredNights} measured of {sleepStats.loggedNights} logged {sleepStats.loggedNights === 1 ? 'night' : 'nights'}.
+                    </span>
+                    <span className="insight-range">{currentSleep.rangeLabel}</span>
+                  </div>
+                </div>
+
+                <div className="panel-card insight-card">
+                  <div>
+                    <p className="eyebrow">Nights at {MIN_SLEEP_HOURS}h or more · {currentSleep.windowLabel}</p>
+                    <strong>{sleepStats.shareAtMinimum !== null ? `${sleepStats.shareAtMinimum}%` : 'No data'}</strong>
+                    <span>Share of measured nights that reached {MIN_SLEEP_HOURS} hours.</span>
+                  </div>
+                </div>
+
+                <div className="panel-card insight-card">
+                  <div>
+                    <p className="eyebrow">Consistency · {currentSleep.windowLabel}</p>
+                    <strong>{sleepStats.spreadHours !== null ? `±${formatHoursLong(sleepStats.spreadHours)}` : 'No data'}</strong>
+                    <span>Typical swing from one night to the next. Lower means steadier.</span>
+                  </div>
+                </div>
+
+                <div className="panel-card insight-card">
+                  <div>
+                    <p className="eyebrow">Balance vs {TARGET_SLEEP_HOURS}h · {currentSleep.windowLabel}</p>
+                    <strong>
+                      {sleepStats.balanceHours !== null
+                        ? `${sleepStats.balanceHours >= 0 ? '+' : ''}${formatHoursLong(sleepStats.balanceHours)}`
+                        : 'No data'}
+                    </strong>
+                    <span>Total hours over or under {TARGET_SLEEP_HOURS} across measured nights.</span>
+                  </div>
+                </div>
+
+                <div className="panel-card insight-card">
+                  <div>
+                    <p className="eyebrow">Best and shortest · {currentSleep.windowLabel}</p>
+                    <strong>{sleepStats.longest ? formatHoursLong(sleepStats.longest.hours ?? 0) : 'No data'}</strong>
+                    {sleepStats.longest && sleepStats.shortest && (
+                      <span>
+                        Longest {formatDisplayDate(toDateFromKey(sleepStats.longest.date))} · shortest{' '}
+                        {formatHoursLong(sleepStats.shortest.hours ?? 0)} on {formatDisplayDate(toDateFromKey(sleepStats.shortest.date))}
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                <div className="panel-card insight-card">
+                  <div>
+                    <p className="eyebrow">Weekend vs weekday · {currentSleep.windowLabel}</p>
+                    <strong>
+                      {sleepStats.weekendAverage !== null && sleepStats.weekdayAverage !== null
+                        ? `${sleepStats.weekendAverage - sleepStats.weekdayAverage >= 0 ? '+' : ''}${formatHoursLong(sleepStats.weekendAverage - sleepStats.weekdayAverage)}`
+                        : 'No data'}
+                    </strong>
+                    <span>
+                      Friday and Saturday nights average {sleepStats.weekendAverage !== null ? formatHoursLong(sleepStats.weekendAverage) : '—'}; other nights {sleepStats.weekdayAverage !== null ? formatHoursLong(sleepStats.weekdayAverage) : '—'}.
+                    </span>
+                  </div>
+                </div>
+
+                <div className="panel-card insight-card">
+                  <div>
+                    <p className="eyebrow">Typical wake-up · {currentSleep.windowLabel}</p>
+                    <strong>{sleepStats.averageWakeMinutes !== null ? formatMinutesOfClock(sleepStats.averageWakeMinutes) : 'No wake-ups'}</strong>
+                    {sleepStats.wakeSpreadMinutes !== null && (
+                      <span>Typically within ±{Math.round(sleepStats.wakeSpreadMinutes)} minutes of that time.</span>
+                    )}
                   </div>
                 </div>
               </aside>

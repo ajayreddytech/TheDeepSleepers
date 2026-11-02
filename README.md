@@ -48,6 +48,17 @@ Without Supabase configuration, app data is stored in the current browser's loca
 
 When you sign in, existing local data is preserved on the device. If the account already has cloud records, the app displays those records while keeping the local backup separate. If the account has no cloud records, your local data remains visible and you can either import it to the account or choose to start using cloud storage. Data is not silently deleted or automatically merged. Signing out restores the saved local data on that device.
 
+## Sleep tab and wake-up data
+
+The Sleep tab calculates hours slept for each night as the logged bedtime for an evening minus the wake-up time logged for the following date in the separate wake-up app. Nights without a logged wake-up time stay empty.
+
+To enable it, set these variables in `.env` locally and in the Netlify environment, then rebuild:
+
+- `VITE_WAKE_SUPABASE_URL`: the wake-up app's Supabase project URL
+- `VITE_WAKE_SUPABASE_ANON_KEY`: that project's publishable key
+
+Reading wake-up times requires a Google sign-in on the wake-up project (the **Connect wake-up app** button on the Sleep tab). Row-level security there only returns rows for the signed-in user.
+
 ## Project layout
 
 ```text
