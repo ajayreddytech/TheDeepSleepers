@@ -873,7 +873,14 @@ body {
 }
 
 .routine-add-row input {
-  flex: 1;
+  flex: 1 1 0;
+  width: auto;
+  min-width: 0;
+}
+
+.routine-add-row .primary-button {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .checklist-list {
@@ -909,10 +916,23 @@ body {
   color: var(--text);
 }
 
+.checklist-item.view-mode {
+  grid-template-columns: 38px minmax(0, 1fr);
+}
+
 .checklist-actions {
   display: flex;
   align-items: center;
   gap: 0.35rem;
+}
+
+.checklist-item.editing {
+  border-color: rgba(129, 161, 255, 0.45);
+}
+
+.checklist-edit-input {
+  width: 100%;
+  min-width: 0;
 }
 
 .drag-handle {
@@ -1274,12 +1294,35 @@ body {
     flex-wrap: wrap;
   }
 
+  /* Phones: keep the toggle, label, edit, reorder and delete on one compact line. */
   .checklist-item {
-    grid-template-columns: 34px 1fr;
+    grid-template-columns: 32px minmax(0, 1fr) auto;
+    gap: 0.5rem;
+    padding: 0.6rem 0.65rem;
+    border-radius: 12px;
+  }
+
+  .check-toggle {
+    width: 30px;
+    height: 30px;
+  }
+
+  .checklist-item.view-mode {
+    grid-template-columns: 30px minmax(0, 1fr);
   }
 
   .checklist-actions {
-    grid-column: 2;
-    justify-content: flex-end;
+    gap: 0.2rem;
+  }
+
+  .checklist-actions .icon-button,
+  .checklist-actions .drag-handle {
+    width: 30px;
+    height: 30px;
+  }
+
+  .checklist-item > span {
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
 }

@@ -443,14 +443,36 @@ function buildSleepPeriod(
 type RoutineStepRowProps = {
   step: RoutineStep
   isComplete: boolean
+  isEditing: boolean
+  editValue: string
   onToggle: () => void
   onDelete: () => void
   onMove: (direction: -1 | 1) => void
   onDragStart: () => void
   onDragEnd: () => void
+  onStartEdit: () => void
+  onEditChange: (value: string) => void
+  onSaveEdit: () => void
+  onCancelEdit: () => void
+  isEditMode: boolean
 }
 
-function RoutineStepRow({ step, isComplete, onToggle, onDelete, onMove, onDragStart, onDragEnd }: RoutineStepRowProps) {
+function RoutineStepRow({
+  step,
+  isComplete,
+  isEditing,
+  editValue,
+  onToggle,
+  onDelete,
+  onMove,
+  onDragStart,
+  onDragEnd,
+  onStartEdit,
+  onEditChange,
+  onSaveEdit,
+  onCancelEdit,
+  isEditMode,
+}: RoutineStepRowProps) {
   const dragControls = useDragControls()
 
   const handleHandleKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
@@ -463,6 +485,16 @@ function RoutineStepRow({ step, isComplete, onToggle, onDelete, onMove, onDragSt
     }
   }
 
+  const handleEditKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      onSaveEdit()
+    } else if (event.key === 'Escape') {
+      event.preventDefault()
+      onCancelEdit()
+    }
+  }
+
   return (
     <Reorder.Item
       as="div"
@@ -472,27 +504,57 @@ function RoutineStepRow({ step, isComplete, onToggle, onDelete, onMove, onDragSt
       onDragStart={onDragStart}
       onDragEnd={onDragEnd}
       whileDrag={{ scale: 1.01 }}
-      className={`checklist-item ${isComplete ? 'complete' : ''}`}
+      className={`checklist-item ${isComplete ? 'complete' : ''} ${isEditing ? 'editing' : ''} ${isEditMode ? '' : 'view-mode'}`}
     >
       <button type="button" className="check-toggle" onClick={onToggle} aria-label={`${isComplete ? 'Mark incomplete' : 'Mark complete'} ${step.label}`}>
         {isComplete ? <Check size={14} /> : <CircleDashed size={14} />}
       </button>
-      <span>{step.label}</span>
+      {isEditing ? (
+        <input
+          type="text"
+          className="checklist-edit-input"
+          value={editValue}
+          autoFocus
+          aria-label={`Edit routine step ${step.label}`}
+          onChange={(event) => onEditChange(event.target.value)}
+          onKeyDown={handleEditKeyDown}
+        />
+      ) : (
+        <span>{step.label}</span>
+      )}
+      {isEditing || isEditMode ? (
       <div className="checklist-actions">
-        <button
-          type="button"
-          className="drag-handle"
-          onPointerDown={(event) => dragControls.start(event)}
-          onKeyDown={handleHandleKeyDown}
-          aria-label={`Reorder ${step.label} by dragging, or with the up and down arrow keys`}
-          title="Drag to reorder"
-        >
-          <GripVertical size={16} />
-        </button>
-        <button type="button" className="icon-button danger" onClick={onDelete} aria-label={`Delete ${step.label}`}>
-          <Trash2 size={14} />
-        </button>
+        {isEditing ? (
+          <>
+            <button type="button" className="icon-button" onClick={onSaveEdit} disabled={!editValue.trim()} aria-label={`Save ${step.label}`} title="Save">
+              <Save size={14} />
+            </button>
+            <button type="button" className="icon-button" onClick={onCancelEdit} aria-label="Cancel editing" title="Cancel">
+              <X size={14} />
+            </button>
+          </>
+        ) : (
+          <>
+            <button type="button" className="icon-button" onClick={onStartEdit} aria-label={`Edit ${step.label}`} title="Edit">
+              <PencilLine size={14} />
+            </button>
+            <button
+              type="button"
+              className="drag-handle"
+              onPointerDown={(event) => dragControls.start(event)}
+              onKeyDown={handleHandleKeyDown}
+              aria-label={`Reorder ${step.label} by dragging, or with the up and down arrow keys`}
+              title="Drag to reorder"
+            >
+              <GripVertical size={16} />
+            </button>
+            <button type="button" className="icon-button danger" onClick={onDelete} aria-label={`Delete ${step.label}`}>
+              <Trash2 size={14} />
+            </button>
+          </>
+        )}
       </div>
+      ) : null}
     </Reorder.Item>
   )
 }
@@ -519,6 +581,9 @@ function App() {
   const [calendarMonth, setCalendarMonth] = useState(() => getMonthStart(new Date()))
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle')
   const [routineField, setRoutineField] = useState('')
+  const [isRoutineEditMode, setIsRoutineEditMode] = useState(false)
+  const [editingStepId, setEditingStepId] = useState<string | null>(null)
+  const [editingStepLabel, setEditingStepLabel] = useState('')
   const [insightsRange, setInsightsRange] = useState<RangeKind>('month')
   const [insightsAnchor, setInsightsAnchor] = useState(() => new Date())
   const [sleepRange, setSleepRange] = useState<RangeKind>('month')
@@ -1126,8 +1191,46 @@ function App() {
     setRoutineField('')
   }
 
+  const handleStartEditRoutineStep = (step: RoutineStep) => {
+    setEditingStepId(step.id)
+    setEditingStepLabel(step.label)
+  }
+
+  const handleCancelEditRoutineStep = () => {
+    setEditingStepId(null)
+    setEditingStepLabel('')
+  }
+
+  const handleSaveRoutineStepEdit = async () => {
+    if (cloudLoading || !editingStepId) return
+    const label = editingStepLabel.trim()
+    if (!label) return
+    const stepId = editingStepId
+    const current = routineSteps.find((step) => step.id === stepId)
+    if (!current) {
+      handleCancelEditRoutineStep()
+      return
+    }
+    if (current.label === label) {
+      handleCancelEditRoutineStep()
+      return
+    }
+    if (supabase && authUser && cloudDataActive) {
+      try {
+        const { error } = await supabase.from('routine_steps').update({ label }).eq('user_id', authUser.id).eq('id', stepId)
+        if (error) throw error
+      } catch (error) {
+        setCloudError(`Could not update the routine step: ${error instanceof Error ? error.message : String(error)}`)
+        return
+      }
+    }
+    setRoutineSteps((steps) => steps.map((step) => (step.id === stepId ? { ...step, label } : step)))
+    handleCancelEditRoutineStep()
+  }
+
   const handleDeleteRoutineStep = async (stepId: string) => {
     if (cloudLoading) return
+    if (editingStepId === stepId) handleCancelEditRoutineStep()
     if (supabase && authUser && cloudDataActive) {
       try {
         const { error } = await supabase.from('routine_steps').delete().eq('user_id', authUser.id).eq('id', stepId)
@@ -1910,6 +2013,21 @@ function App() {
                     <p className="eyebrow">Your ritual</p>
                     <h2>Build your evening routine</h2>
                   </div>
+                  {routineSteps.length ? (
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      aria-pressed={isRoutineEditMode}
+                      aria-label={isRoutineEditMode ? 'Done editing routine' : 'Edit routine'}
+                      title={isRoutineEditMode ? 'Done editing routine' : 'Edit routine'}
+                      onClick={() => {
+                        if (isRoutineEditMode) handleCancelEditRoutineStep()
+                        setIsRoutineEditMode((current) => !current)
+                      }}
+                    >
+                      {isRoutineEditMode ? <Check size={14} /> : <PencilLine size={14} />}
+                    </button>
+                  ) : null}
                 </div>
                 <p className="section-copy">Define your own wind-down steps and mark what you completed for the selected evening.</p>
 
@@ -1944,6 +2062,13 @@ function App() {
                         onMove={(direction) => moveRoutineStep(step.id, direction)}
                         onDragStart={handleRoutineDragStart}
                         onDragEnd={handleRoutineDragEnd}
+                        isEditing={editingStepId === step.id}
+                        editValue={editingStepLabel}
+                        onStartEdit={() => handleStartEditRoutineStep(step)}
+                        onEditChange={setEditingStepLabel}
+                        onSaveEdit={() => void handleSaveRoutineStepEdit()}
+                        onCancelEdit={handleCancelEditRoutineStep}
+                        isEditMode={isRoutineEditMode}
                       />
                     ))}
                   </Reorder.Group>
