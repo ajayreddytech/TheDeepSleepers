@@ -321,6 +321,8 @@ const TONE_TEXT: Record<CompletionTone, { label: string; tooltip: string }> = {
   empty: { label: 'no entry', tooltip: 'no entry' },
 }
 
+const UNTRACKED_TONE_TEXT = { label: 'wind-down not tracked', tooltip: 'not tracked' }
+
 type InsightsPeriod = {
   range: RangeKind
   windowLabel: string
@@ -374,13 +376,16 @@ function buildInsightsPeriod(
     ...Array.from({ length: leadingOffset }, (_, index) => spacer(`offset-${index}`)),
     ...info.dates.map((dateKey): HeatmapCell => {
       const entry = entryMap[dateKey]
-      const tone: CompletionTone = !entry ? 'empty' : entry.routineCompleted ? 'done' : 'missed'
+      // Past days with no entry are untracked and shown as missed. Today's evening stays neutral.
+      const isUntracked = !entry && dateKey < todayKey
+      const tone: CompletionTone = !entry ? (isUntracked ? 'missed' : 'empty') : entry.routineCompleted ? 'done' : 'missed'
+      const text = isUntracked ? UNTRACKED_TONE_TEXT : TONE_TEXT[tone]
       return {
         key: dateKey,
         date: dateKey,
         tone,
-        label: `${dateKey}: ${TONE_TEXT[tone].label}`,
-        tooltip: `${formatDisplayDate(toDateFromKey(dateKey))}: ${TONE_TEXT[tone].tooltip}`,
+        label: `${dateKey}: ${text.label}`,
+        tooltip: `${formatDisplayDate(toDateFromKey(dateKey))}: ${text.tooltip}`,
       }
     }),
   ]
@@ -1595,7 +1600,7 @@ function App() {
                           type="button"
                           className="calendar-date-target"
                           disabled={dateKey > todayDateKey}
-                          aria-label={`${formatDisplayDate(date)}${entry ? `, bedtime ${formatTimeAsClock(entry.bedtime)}, wind-down ${entry.routineCompleted ? 'completed' : 'not completed'}` : ', no bedtime logged'}`}
+                          aria-label={`${formatDisplayDate(date)}${entry ? `, bedtime ${formatTimeAsClock(entry.bedtime)}, wind-down ${entry.routineCompleted ? 'completed' : 'not completed'}` : dateKey < todayDateKey ? ', wind-down not tracked' : ', no bedtime logged'}`}
                           onClick={() => handleCalendarSelect(dateKey)}
                         >
                           <span className="calendar-date">{date.getDate()}</span>
@@ -1603,6 +1608,11 @@ function App() {
                             <span className="calendar-entry">
                               <span>{formatTimeAsClock(entry.bedtime)}</span>
                               {entry.routineCompleted ? <Check className="calendar-complete" size={15} /> : <X className="calendar-missed" size={15} />}
+                            </span>
+                          )}
+                          {!entry && dateKey < todayDateKey && (
+                            <span className="calendar-entry">
+                              <X className="calendar-missed" size={15} />
                             </span>
                           )}
                         </button>
